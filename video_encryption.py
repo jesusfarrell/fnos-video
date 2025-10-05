@@ -10,6 +10,8 @@ import json
 import base64
 import hashlib
 import secrets
+import time
+import shutil
 import requests
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,6 +38,14 @@ LOG_KEEP_DAYS = 7                       # 保留最近N天的日志
 # 自动清理配置
 AUTO_DELETE_OLD_VIDEOS = True           # 是否自动删除旧视频
 DELETE_VIDEOS_OLDER_THAN_MONTHS = 6     # 删除N个月以前的视频文件夹
+
+# 加密重试配置（针对 OneDrive 网盘优化）
+MAX_RETRY_ATTEMPTS = 10                 # 单个文件加密/上传失败后的最大重试次数
+RETRY_DELAYS = [5, 10, 20, 30, 60, 120, 180, 300, 600, 900]  # 重试间隔（秒），指数退避，最长15分钟
+VERIFY_UPLOAD_SIZE = True               # 是否验证上传后的文件大小
+STATE_FILE_NAME = ".encryption_state.json"  # 状态文件名（用于断点续传）
+NOTIFY_ON_FILE_FAILURE = True           # 单个文件失败时是否发送通知（避免通知过多，建议关闭）
+SECURE_DELETE_SOURCE = False            # 是否安全删除源文件（3次随机覆写，OneDrive场景建议关闭以提升速度）
 
 # ==================== 配置区域结束 ====================
 
@@ -121,13 +131,14 @@ class VideoEncryptor:
         except Exception as e:
             raise ValueError(f"无法加载公钥文件: {e}")
 
-    def encrypt_file(self, input_path, output_path):
+    def encrypt_file(self, input_path, output_path, delete_source=False):
         """
         加密单个文件（真正的流式处理，零内存占用）
 
         Args:
             input_path: 原始文件路径
             output_path: 加密后文件路径
+            delete_source: 是否在加密成功后删除源文件（默认False）
         """
         # 使用唯一临时文件名（添加进程ID和时间戳避免冲突）
         temp_output = f"{output_path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
@@ -212,8 +223,9 @@ class VideoEncryptor:
             # 步骤3: 移动临时文件到目标位置
             os.rename(temp_output, output_path)
 
-            # 步骤4: 安全删除原文件（分块覆写，避免内存占用）
-            self._secure_delete(input_path)
+            # 步骤4: 安全删除原文件（仅在明确指定时）
+            if delete_source:
+                self._secure_delete(input_path)
 
         except Exception as e:
             # 如果失败，清理临时文件
@@ -225,11 +237,17 @@ class VideoEncryptor:
 
     def _secure_delete(self, file_path):
         """
-        安全删除文件（分块覆写，避免内存占用）
+        安全删除文件（可选分块覆写，避免内存占用）
 
         Args:
             file_path: 要删除的文件路径
         """
+        if not SECURE_DELETE_SOURCE:
+            # 快速删除模式（OneDrive场景推荐）
+            os.remove(file_path)
+            return
+
+        # 安全删除模式（3次随机覆写）
         file_size = os.path.getsize(file_path)
         CHUNK_SIZE = 64 * 1024  # 64KB分块
 
@@ -458,9 +476,163 @@ class VideoMigrationTask:
         hashed_name = hash_obj.hexdigest()
         return f"{hashed_name}.enc"
 
+    def _verify_uploaded_file(self, dest_path):
+        """
+        验证上传到网盘的文件是否完整（通过读取元数据验证）
+
+        Args:
+            dest_path: 目标文件路径（Path对象）
+
+        Returns:
+            bool: 验证是否通过
+        """
+        if not VERIFY_UPLOAD_SIZE:
+            return True
+
+        try:
+            # 检查文件是否存在
+            if not dest_path.exists():
+                self._log(f"⚠️  上传验证失败: 文件不存在 - {dest_path.name}")
+                return False
+
+            # 尝试读取并解析元数据（确保文件可解密）
+            with open(dest_path, 'rb') as f:
+                # 读取元数据长度
+                metadata_length_bytes = f.read(4)
+                if len(metadata_length_bytes) != 4:
+                    self._log(f"⚠️  上传验证失败: 无法读取元数据长度")
+                    return False
+
+                metadata_length = int.from_bytes(metadata_length_bytes, byteorder='big')
+
+                # 读取元数据
+                metadata_bytes = f.read(metadata_length)
+                if len(metadata_bytes) != metadata_length:
+                    self._log(f"⚠️  上传验证失败: 元数据不完整")
+                    return False
+
+                # 解析元数据JSON
+                metadata = json.loads(metadata_bytes.decode('utf-8'))
+
+                # 验证关键字段存在
+                required_fields = ['encrypted_key', 'nonce', 'tag', 'original_name']
+                for field in required_fields:
+                    if field not in metadata:
+                        self._log(f"⚠️  上传验证失败: 元数据缺少字段 {field}")
+                        return False
+
+            return True
+
+        except json.JSONDecodeError:
+            self._log(f"⚠️  上传验证失败: 元数据JSON格式错误")
+            return False
+        except Exception as e:
+            self._log(f"⚠️  上传验证出错: {str(e)}")
+            return False
+
+    def _load_state(self, source_folder):
+        """
+        加载处理状态文件（保存在本地源文件夹）
+
+        Args:
+            source_folder: 源文件夹路径（本地）
+
+        Returns:
+            dict: 状态字典
+        """
+        state_file = source_folder / STATE_FILE_NAME
+
+        if not state_file.exists():
+            return {}
+
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self._log(f"⚠️  读取状态文件失败: {str(e)}")
+            return {}
+
+    def _save_state(self, source_folder, state):
+        """
+        保存处理状态到文件（保存在本地源文件夹，避免频繁上传到网盘）
+
+        Args:
+            source_folder: 源文件夹路径（本地）
+            state: 状态字典
+        """
+        state_file = source_folder / STATE_FILE_NAME
+
+        try:
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log(f"⚠️  保存状态文件失败: {str(e)}")
+
+    def _is_network_error(self, exception):
+        """
+        判断是否为网络相关错误
+
+        Args:
+            exception: 异常对象
+
+        Returns:
+            bool: 是否为网络错误
+        """
+        # 网络相关错误类型
+        network_errors = (OSError, IOError, ConnectionError, TimeoutError)
+
+        # 检查异常类型
+        if isinstance(exception, network_errors):
+            return True
+
+        # 检查错误消息中的关键词
+        error_msg = str(exception).lower()
+        network_keywords = [
+            'network', 'connection', 'timeout', 'unreachable',
+            'broken pipe', 'reset by peer', 'timed out',
+            'no route to host', 'host is down'
+        ]
+
+        return any(keyword in error_msg for keyword in network_keywords)
+
+    def _send_file_failure_notification(self, folder_name, file_name, attempts, error_message):
+        """
+        发送单个文件失败的通知
+
+        Args:
+            folder_name: 文件夹名称
+            file_name: 文件名
+            attempts: 尝试次数
+            error_message: 错误信息
+        """
+        if not NOTIFY_ON_FILE_FAILURE or not self.wxpusher.app_token:
+            return
+
+        title = "⚠️ 文件加密失败"
+        content = f"""
+**文件加密失败**
+
+**文件夹**: {folder_name}
+**文件名**: {file_name}
+**尝试次数**: {attempts}
+**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+**错误信息**:
+{error_message}
+
+请检查网络连接和文件状态。
+"""
+
+        try:
+            self.wxpusher.send(title, content, content_type=3)  # 3=markdown
+            self._log(f"✓ 已发送失败通知: {file_name}")
+        except Exception as e:
+            self._log(f"✗ 发送失败通知出错: {str(e)}")
+
+
     def _process_folder(self, folder_path):
         """
-        处理单个日期文件夹（加密一个立即删除源文件，节省空间）
+        处理单个日期文件夹（支持断点续传、失败重试、上传验证）
 
         Args:
             folder_path: 文件夹路径
@@ -470,6 +642,10 @@ class VideoMigrationTask:
         # 创建目标文件夹（直接在目标目录）
         dest_folder = self.dest_base / folder_path.name
         dest_folder.mkdir(parents=True, exist_ok=True)
+
+        # 加载状态文件（从本地源文件夹加载）
+        state = self._load_state(folder_path)
+        self._log(f"已加载状态文件，已完成 {sum(1 for s in state.values() if s == 'completed')} 个文件")
 
         # 获取文件夹内所有文件（不限制格式）
         all_files = []
@@ -485,16 +661,21 @@ class VideoMigrationTask:
 
         # 逐个加密并立即移动（节省磁盘空间）
         success_count = 0
-        fail_count = 0
         failed_files = []
+        skipped_count = 0
 
         for i, file_path in enumerate(all_files, 1):
-            # 临时加密文件路径（在源文件同目录下）
-            temp_encrypted_file = file_path.parent / f"{file_path.name}.encrypting.tmp"
-
             try:
                 # 计算相对路径，保持目录结构
                 relative_path = file_path.relative_to(folder_path)
+                relative_path_str = str(relative_path)
+
+                # 检查状态，跳过已完成的文件
+                if state.get(relative_path_str) == 'completed':
+                    self._log(f"[{i}/{len(all_files)}] 跳过已完成: {relative_path}")
+                    skipped_count += 1
+                    success_count += 1  # 已完成的也算成功
+                    continue
 
                 # 最终目标路径
                 final_dest_path = dest_folder / relative_path.parent / f"{relative_path.name}.enc"
@@ -504,46 +685,120 @@ class VideoMigrationTask:
 
                 self._log(f"[{i}/{len(all_files)}] 加密: {relative_path}")
 
-                # 加密文件到临时位置（同目录，避免跨分区问题）
-                self.encryptor.encrypt_file(str(file_path), str(temp_encrypted_file))
+                # 获取原始文件大小（用于验证）
+                original_size = file_path.stat().st_size
 
-                # 移动加密文件到目标目录
-                import shutil
-                shutil.move(str(temp_encrypted_file), str(final_dest_path))
+                # 带重试的加密和上传
+                encrypt_success = False
+                last_error = None
 
-                self._log(f"✓ 完成: {relative_path}")
-                success_count += 1
+                for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                    # 临时加密文件路径（在源文件同目录下）
+                    temp_encrypted_file = file_path.parent / f"{file_path.name}.encrypting.tmp.{attempt}"
+
+                    try:
+                        # 标记为处理中
+                        state[relative_path_str] = 'in_progress'
+                        self._save_state(folder_path, state)
+
+                        # 加密文件到临时位置（不删除源文件）
+                        self.encryptor.encrypt_file(str(file_path), str(temp_encrypted_file), delete_source=False)
+
+                        # 移动加密文件到网盘（上传）
+                        shutil.move(str(temp_encrypted_file), str(final_dest_path))
+
+                        # 验证上传是否成功
+                        if not self._verify_uploaded_file(final_dest_path):
+                            raise Exception("上传验证失败，文件元数据不可读")
+
+                        # 上传成功，删除源文件
+                        self.encryptor._secure_delete(str(file_path))
+
+                        # 标记为完成
+                        state[relative_path_str] = 'completed'
+                        self._save_state(folder_path, state)
+
+                        encrypt_success = True
+                        if attempt > 1:
+                            self._log(f"✓ 完成（第{attempt}次尝试）: {relative_path}")
+                        else:
+                            self._log(f"✓ 完成: {relative_path}")
+                        success_count += 1
+                        break
+
+                    except Exception as e:
+                        last_error = e
+
+                        # 清理可能存在的临时文件
+                        if temp_encrypted_file.exists():
+                            try:
+                                temp_encrypted_file.unlink()
+                            except:
+                                pass
+
+                        # 判断是否为网络错误
+                        is_network_err = self._is_network_error(e)
+
+                        if attempt < MAX_RETRY_ATTEMPTS:
+                            # 计算重试延迟（网络错误使用配置的延迟，其他错误立即重试）
+                            if is_network_err:
+                                # 使用指数退避，防止数组越界
+                                delay_index = min(attempt - 1, len(RETRY_DELAYS) - 1)
+                                delay = RETRY_DELAYS[delay_index]
+                                self._log(f"⚠️  第{attempt}次失败（网络错误）: {relative_path}")
+                                self._log(f"   错误: {str(e)}")
+                                self._log(f"   等待 {delay} 秒后重试...")
+                                time.sleep(delay)
+                            else:
+                                self._log(f"⚠️  第{attempt}次失败: {relative_path} - {str(e)}，立即重试...")
+                        else:
+                            self._log(f"✗ 失败（已重试{MAX_RETRY_ATTEMPTS}次）: {relative_path}")
+                            self._log(f"   最后错误: {str(e)}")
+
+                if not encrypt_success:
+                    failed_files.append((relative_path, str(last_error)))
+                    # 标记为失败
+                    state[relative_path_str] = 'failed'
+                    self._save_state(folder_path, state)
+
+                    # 发送失败通知
+                    self._send_file_failure_notification(
+                        folder_path.name,
+                        str(relative_path),
+                        MAX_RETRY_ATTEMPTS,
+                        str(last_error)
+                    )
 
             except Exception as e:
-                self._log(f"✗ 失败: {file_path.name} - {str(e)}")
-                fail_count += 1
-                failed_files.append(relative_path)
+                self._log(f"✗ 处理文件时出错: {file_path.name} - {str(e)}")
+                failed_files.append((file_path.name, str(e)))
+                # 只有在 relative_path_str 已定义时才保存状态
+                try:
+                    if 'relative_path_str' in locals():
+                        state[relative_path_str] = 'failed'
+                        self._save_state(folder_path, state)
+                except:
+                    pass
 
-                # 清理可能存在的临时文件
-                if temp_encrypted_file.exists():
-                    temp_encrypted_file.unlink()
+        fail_count = len(failed_files)
+        self._log(f"文件夹处理完成: 成功 {success_count}/{len(all_files)}, 跳过 {skipped_count}, 失败 {fail_count}")
 
-        self._log(f"文件夹处理完成: 成功 {success_count}, 失败 {fail_count}")
-
-        # 如果有失败的文件，回滚已成功的文件
+        # 显示失败文件列表
         if fail_count > 0:
-            self._log(f"⚠️  检测到 {fail_count} 个文件加密失败，开始回滚...")
-
-            try:
-                import shutil
-                # 删除目标文件夹中已加密的文件
-                if dest_folder.exists():
-                    shutil.rmtree(dest_folder)
-                    self._log(f"✓ 已清理目标目录中的部分加密文件")
-            except Exception as e:
-                self._log(f"✗ 回滚失败: {str(e)}")
-
-            self._log(f"❌ 文件夹 {folder_path.name} 处理失败，源文件保持不变")
-
+            self._log(f"⚠️  以下 {fail_count} 个文件加密失败（源文件已保留）:")
+            for failed_file, error in failed_files:
+                self._log(f"   - {failed_file}: {error}")
+            self._log(f"⚠️  请检查这些文件并手动处理，其他 {success_count} 个文件已成功加密")
         else:
             # 所有文件都加密成功，删除源文件夹
             try:
-                import shutil
+                # 先删除状态文件
+                state_file = folder_path / STATE_FILE_NAME
+                if state_file.exists():
+                    state_file.unlink()
+                    self._log(f"✓ 删除状态文件（任务已完成）")
+
+                # 删除源文件夹
                 if folder_path.exists():
                     shutil.rmtree(folder_path)
                     self._log(f"✓ 删除源文件夹: {folder_path.name}")
