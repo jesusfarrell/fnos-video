@@ -12,9 +12,11 @@ import hashlib
 import secrets
 import time
 import shutil
+import threading
 import requests
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -46,6 +48,9 @@ VERIFY_UPLOAD_SIZE = True               # 是否验证上传后的文件大小
 STATE_FILE_NAME = ".encryption_state.json"  # 状态文件名（用于断点续传）
 NOTIFY_ON_FILE_FAILURE = True           # 单个文件失败时是否发送通知（避免通知过多，建议关闭）
 SECURE_DELETE_SOURCE = False            # 是否安全删除源文件（3次随机覆写，OneDrive场景建议关闭以提升速度）
+
+# 并发配置（多线程优化）
+CONCURRENT_WORKERS = 3                  # 并发处理文件数（建议3-4，OneDrive场景不建议超过5以避免限流）
 
 # ==================== 配置区域结束 ====================
 
@@ -318,21 +323,31 @@ class VideoMigrationTask:
         uids = wxpusher_uids or WXPUSHER_UIDS or []
         self.wxpusher = WxPusher(token, topic_ids, uids)
 
+        # 初始化线程锁（保护状态文件和日志）
+        self._state_lock = threading.Lock()
+        self._log_lock = threading.Lock()
+
     def _log(self, message):
-        """记录日志（使用缓冲区减少IO）"""
+        """记录日志（使用缓冲区减少IO，线程安全）"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_message = f"[{timestamp}] {message}\n"
         print(log_message.strip())
 
-        # 添加到缓冲区
-        self._log_buffer.append(log_message)
+        # 添加到缓冲区（线程安全）
+        with self._log_lock:
+            self._log_buffer.append(log_message)
 
-        # 每10条日志或遇到关键信息时写入文件
-        if len(self._log_buffer) >= 10 or '完成' in message or '失败' in message:
-            self._flush_logs()
+            # 每10条日志或遇到关键信息时写入文件
+            if len(self._log_buffer) >= 10 or '完成' in message or '失败' in message:
+                self._flush_logs_unsafe()  # 已在锁内，调用不加锁版本
 
     def _flush_logs(self):
-        """刷新日志缓冲区到文件"""
+        """刷新日志缓冲区到文件（线程安全）"""
+        with self._log_lock:
+            self._flush_logs_unsafe()
+
+    def _flush_logs_unsafe(self):
+        """刷新日志缓冲区到文件（内部方法，不加锁，需在锁内调用）"""
         if self._log_buffer:
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.writelines(self._log_buffer)
@@ -442,8 +457,17 @@ class VideoMigrationTask:
             self._log(f"清理旧视频文件夹失败: {str(e)}")
 
     def _get_yesterday_folders(self):
-        """获取昨天及更早的日期文件夹"""
-        yesterday = datetime.now() - timedelta(days=1)
+        """获取昨天及更早的日期文件夹（凌晨1点后才处理昨天的文件）"""
+        current_time = datetime.now()
+        current_hour = current_time.hour
+
+        # 凌晨1点前（0:00-0:59），往前推2天（避免处理当天正在写入的文件）
+        # 凌晨1点后（1:00-23:59），往前推1天
+        if current_hour < 1:
+            yesterday = current_time - timedelta(days=2)
+        else:
+            yesterday = current_time - timedelta(days=1)
+
         yesterday_str = yesterday.strftime('%Y%m%d')
 
         folders = []
@@ -554,7 +578,7 @@ class VideoMigrationTask:
 
     def _save_state(self, source_folder, state):
         """
-        保存处理状态到文件（保存在本地源文件夹，避免频繁上传到网盘）
+        保存处理状态到文件（保存在本地源文件夹，避免频繁上传到网盘，线程安全）
 
         Args:
             source_folder: 源文件夹路径（本地）
@@ -563,8 +587,9 @@ class VideoMigrationTask:
         state_file = source_folder / STATE_FILE_NAME
 
         try:
-            with open(state_file, 'w', encoding='utf-8') as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+            with self._state_lock:  # 线程安全
+                with open(state_file, 'w', encoding='utf-8') as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log(f"⚠️  保存状态文件失败: {str(e)}")
 
@@ -630,6 +655,131 @@ class VideoMigrationTask:
             self._log(f"✗ 发送失败通知出错: {str(e)}")
 
 
+    def _process_single_file(self, file_path, folder_path, dest_folder, state, file_index, total_files):
+        """
+        处理单个文件的加密和上传（线程安全）
+
+        Args:
+            file_path: 文件路径
+            folder_path: 文件夹路径
+            dest_folder: 目标文件夹
+            state: 状态字典（共享）
+            file_index: 文件索引
+            total_files: 总文件数
+
+        Returns:
+            tuple: (success, relative_path, error_message)
+        """
+        try:
+            # 计算相对路径，保持目录结构
+            relative_path = file_path.relative_to(folder_path)
+            relative_path_str = str(relative_path)
+
+            # 检查状态，跳过已完成的文件（需要锁）
+            with self._state_lock:
+                if state.get(relative_path_str) == 'completed':
+                    self._log(f"[{file_index}/{total_files}] 跳过已完成: {relative_path}")
+                    return (True, relative_path, None)
+
+            # 最终目标路径
+            final_dest_path = dest_folder / relative_path.parent / f"{relative_path.name}.enc"
+
+            # 确保目标子目录存在
+            final_dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            self._log(f"[{file_index}/{total_files}] 加密: {relative_path}")
+
+            # 获取原始文件大小（用于验证）
+            original_size = file_path.stat().st_size
+
+            # 带重试的加密和上传
+            encrypt_success = False
+            last_error = None
+
+            for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                # 临时加密文件路径（在源文件同目录下）
+                temp_encrypted_file = file_path.parent / f"{file_path.name}.encrypting.tmp.{attempt}"
+
+                try:
+                    # 标记为处理中（需要锁）
+                    with self._state_lock:
+                        state[relative_path_str] = 'in_progress'
+                    self._save_state(folder_path, state)
+
+                    # 加密文件到临时位置（不删除源文件）
+                    self.encryptor.encrypt_file(str(file_path), str(temp_encrypted_file), delete_source=False)
+
+                    # 移动加密文件到网盘（上传）
+                    shutil.move(str(temp_encrypted_file), str(final_dest_path))
+
+                    # 验证上传是否成功
+                    if not self._verify_uploaded_file(final_dest_path):
+                        raise Exception("上传验证失败，文件元数据不可读")
+
+                    # 上传成功，删除源文件
+                    self.encryptor._secure_delete(str(file_path))
+
+                    # 标记为完成（需要锁）
+                    with self._state_lock:
+                        state[relative_path_str] = 'completed'
+                    self._save_state(folder_path, state)
+
+                    encrypt_success = True
+                    if attempt > 1:
+                        self._log(f"✓ 完成（第{attempt}次尝试）: {relative_path}")
+                    else:
+                        self._log(f"✓ 完成: {relative_path}")
+                    return (True, relative_path, None)
+
+                except Exception as e:
+                    last_error = e
+
+                    # 清理可能存在的临时文件
+                    if temp_encrypted_file.exists():
+                        try:
+                            temp_encrypted_file.unlink()
+                        except:
+                            pass
+
+                    # 判断是否为网络错误
+                    is_network_err = self._is_network_error(e)
+
+                    if attempt < MAX_RETRY_ATTEMPTS:
+                        # 计算重试延迟（网络错误使用配置的延迟，其他错误立即重试）
+                        if is_network_err:
+                            # 使用指数退避，防止数组越界
+                            delay_index = min(attempt - 1, len(RETRY_DELAYS) - 1)
+                            delay = RETRY_DELAYS[delay_index]
+                            self._log(f"⚠️  第{attempt}次失败（网络错误）: {relative_path}")
+                            self._log(f"   错误: {str(e)}")
+                            self._log(f"   等待 {delay} 秒后重试...")
+                            time.sleep(delay)
+                        else:
+                            self._log(f"⚠️  第{attempt}次失败: {relative_path} - {str(e)}，立即重试...")
+                    else:
+                        self._log(f"✗ 失败（已重试{MAX_RETRY_ATTEMPTS}次）: {relative_path}")
+                        self._log(f"   最后错误: {str(e)}")
+
+            # 所有重试都失败
+            with self._state_lock:
+                state[relative_path_str] = 'failed'
+            self._save_state(folder_path, state)
+
+            # 发送失败通知
+            self._send_file_failure_notification(
+                folder_path.name,
+                str(relative_path),
+                MAX_RETRY_ATTEMPTS,
+                str(last_error)
+            )
+
+            return (False, relative_path, str(last_error))
+
+        except Exception as e:
+            self._log(f"✗ 处理文件时出错: {file_path.name} - {str(e)}")
+            return (False, file_path.name, str(e))
+
+
     def _process_folder(self, folder_path):
         """
         处理单个日期文件夹（支持断点续传、失败重试、上传验证）
@@ -659,129 +809,42 @@ class VideoMigrationTask:
 
         self._log(f"找到 {len(all_files)} 个文件")
 
-        # 逐个加密并立即移动（节省磁盘空间）
+        # 使用多线程并发处理文件
         success_count = 0
         failed_files = []
-        skipped_count = 0
 
-        for i, file_path in enumerate(all_files, 1):
-            try:
-                # 计算相对路径，保持目录结构
-                relative_path = file_path.relative_to(folder_path)
-                relative_path_str = str(relative_path)
+        # 创建文件处理任务
+        with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+            # 提交所有任务
+            future_to_file = {}
+            for i, file_path in enumerate(all_files, 1):
+                future = executor.submit(
+                    self._process_single_file,
+                    file_path,
+                    folder_path,
+                    dest_folder,
+                    state,
+                    i,
+                    len(all_files)
+                )
+                future_to_file[future] = file_path
 
-                # 检查状态，跳过已完成的文件
-                if state.get(relative_path_str) == 'completed':
-                    self._log(f"[{i}/{len(all_files)}] 跳过已完成: {relative_path}")
-                    skipped_count += 1
-                    success_count += 1  # 已完成的也算成功
-                    continue
-
-                # 最终目标路径
-                final_dest_path = dest_folder / relative_path.parent / f"{relative_path.name}.enc"
-
-                # 确保目标子目录存在
-                final_dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-                self._log(f"[{i}/{len(all_files)}] 加密: {relative_path}")
-
-                # 获取原始文件大小（用于验证）
-                original_size = file_path.stat().st_size
-
-                # 带重试的加密和上传
-                encrypt_success = False
-                last_error = None
-
-                for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-                    # 临时加密文件路径（在源文件同目录下）
-                    temp_encrypted_file = file_path.parent / f"{file_path.name}.encrypting.tmp.{attempt}"
-
-                    try:
-                        # 标记为处理中
-                        state[relative_path_str] = 'in_progress'
-                        self._save_state(folder_path, state)
-
-                        # 加密文件到临时位置（不删除源文件）
-                        self.encryptor.encrypt_file(str(file_path), str(temp_encrypted_file), delete_source=False)
-
-                        # 移动加密文件到网盘（上传）
-                        shutil.move(str(temp_encrypted_file), str(final_dest_path))
-
-                        # 验证上传是否成功
-                        if not self._verify_uploaded_file(final_dest_path):
-                            raise Exception("上传验证失败，文件元数据不可读")
-
-                        # 上传成功，删除源文件
-                        self.encryptor._secure_delete(str(file_path))
-
-                        # 标记为完成
-                        state[relative_path_str] = 'completed'
-                        self._save_state(folder_path, state)
-
-                        encrypt_success = True
-                        if attempt > 1:
-                            self._log(f"✓ 完成（第{attempt}次尝试）: {relative_path}")
-                        else:
-                            self._log(f"✓ 完成: {relative_path}")
-                        success_count += 1
-                        break
-
-                    except Exception as e:
-                        last_error = e
-
-                        # 清理可能存在的临时文件
-                        if temp_encrypted_file.exists():
-                            try:
-                                temp_encrypted_file.unlink()
-                            except:
-                                pass
-
-                        # 判断是否为网络错误
-                        is_network_err = self._is_network_error(e)
-
-                        if attempt < MAX_RETRY_ATTEMPTS:
-                            # 计算重试延迟（网络错误使用配置的延迟，其他错误立即重试）
-                            if is_network_err:
-                                # 使用指数退避，防止数组越界
-                                delay_index = min(attempt - 1, len(RETRY_DELAYS) - 1)
-                                delay = RETRY_DELAYS[delay_index]
-                                self._log(f"⚠️  第{attempt}次失败（网络错误）: {relative_path}")
-                                self._log(f"   错误: {str(e)}")
-                                self._log(f"   等待 {delay} 秒后重试...")
-                                time.sleep(delay)
-                            else:
-                                self._log(f"⚠️  第{attempt}次失败: {relative_path} - {str(e)}，立即重试...")
-                        else:
-                            self._log(f"✗ 失败（已重试{MAX_RETRY_ATTEMPTS}次）: {relative_path}")
-                            self._log(f"   最后错误: {str(e)}")
-
-                if not encrypt_success:
-                    failed_files.append((relative_path, str(last_error)))
-                    # 标记为失败
-                    state[relative_path_str] = 'failed'
-                    self._save_state(folder_path, state)
-
-                    # 发送失败通知
-                    self._send_file_failure_notification(
-                        folder_path.name,
-                        str(relative_path),
-                        MAX_RETRY_ATTEMPTS,
-                        str(last_error)
-                    )
-
-            except Exception as e:
-                self._log(f"✗ 处理文件时出错: {file_path.name} - {str(e)}")
-                failed_files.append((file_path.name, str(e)))
-                # 只有在 relative_path_str 已定义时才保存状态
+            # 等待所有任务完成并收集结果
+            for future in as_completed(future_to_file):
                 try:
-                    if 'relative_path_str' in locals():
-                        state[relative_path_str] = 'failed'
-                        self._save_state(folder_path, state)
-                except:
-                    pass
+                    success, file_info, error_msg = future.result()
+                    if success:
+                        success_count += 1
+                    else:
+                        failed_files.append((file_info, error_msg))
+                except Exception as e:
+                    file_path = future_to_file[future]
+                    self._log(f"✗ 线程执行异常: {file_path.name} - {str(e)}")
+                    failed_files.append((file_path.name, str(e)))
 
         fail_count = len(failed_files)
-        self._log(f"文件夹处理完成: 成功 {success_count}/{len(all_files)}, 跳过 {skipped_count}, 失败 {fail_count}")
+        self._log(f"文件夹处理完成: 成功 {success_count}/{len(all_files)}, 失败 {fail_count}")
+        self._log(f"并发处理: {CONCURRENT_WORKERS} 个线程")
 
         # 显示失败文件列表
         if fail_count > 0:
